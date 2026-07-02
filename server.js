@@ -1,9 +1,16 @@
 const express = require('express');
+const cors = require('cors');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Allow JSON body
 app.use(express.json());
+
+// Allow requests from your GitHub Pages origin
+app.use(cors({
+  origin: 'https://amanvbhardwaj.github.io',
+}));
 
 // Health check
 app.get('/', (req, res) => {
