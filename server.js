@@ -2,49 +2,45 @@ const express = require('express');
 const cors = require('cors');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
-// Read Gemini API key from environment
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+// Read Groq API key from environment
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 // Allow JSON body
 app.use(express.json());
 
-// Allow requests from your GitHub Pages origin
+// Allow requests from your GitHub Pages origin (or any frontend you use)
 app.use(cors({
   origin: 'https://amanvbhardwaj.github.io',
 }));
 
-// Helper: call Gemini generateContent API
-async function callGemini(prompt) {
-  const endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent';
-
-  const response = await fetch(`${endpoint}?key=${GEMINI_API_KEY}`, {
+// Helper: call Groq Llama 3 chat completions API
+async function callGroq(prompt) {
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-goog-api-key': GEMINI_API_KEY,
+      'Authorization': `Bearer ${GROQ_API_KEY}`,
     },
     body: JSON.stringify({
-      contents: [
-        {
-          parts: [
-            { text: prompt }
-          ]
-        }
-      ]
+      model: 'llama3-70b-8192',
+      messages: [
+        { role: 'system', content: 'You are a helpful AI assistant called Jarvis.' },
+        { role: 'user', content: prompt },
+      ],
     }),
   });
 
   if (!response.ok) {
-    throw new Error(`Gemini API error: ${response.status} ${response.statusText}`);
+    throw new Error(`Groq API error: ${response.status} ${response.statusText}`);
   }
 
   const data = await response.json();
 
-  // Safely extract the first text response from Gemini
+  // Safely extract the first text response from Groq
   const text =
-    data?.candidates?.[0]?.content?.parts?.[0]?.text ||
+    data?.choices?.[0]?.message?.content ||
     'Sorry, I could not generate a reply.';
 
   return text;
@@ -52,26 +48,26 @@ async function callGemini(prompt) {
 
 // Health check
 app.get('/', (req, res) => {
-  res.send('Aman Jarvis backend v1 (Gemini) is running');
+  res.send('Aman Jarvis backend v2 (Groq Llama 3) is running');
 });
 
-// Jarvis endpoint: now uses Gemini
+// Jarvis endpoint: now uses Groq
 app.post('/api/jarvis', async (req, res) => {
   try {
     const userMessage = req.body.message || '';
 
-    if (!GEMINI_API_KEY) {
+    if (!GROQ_API_KEY) {
       return res.status(500).json({
-        reply: 'Server error: GEMINI_API_KEY is not set on the backend.',
+        reply: 'Server error: GROQ_API_KEY is not set on the backend.',
       });
     }
 
-    const reply = await callGemini(userMessage);
+    const reply = await callGroq(userMessage);
     res.json({ reply });
   } catch (err) {
     console.error('Error in /api/jarvis:', err);
     res.status(500).json({
-      reply: 'Server error: something went wrong while talking to Gemini.',
+      reply: 'Server error: something went wrong while talking to Groq.',
     });
   }
 });
