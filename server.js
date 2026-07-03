@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 
 const app = express();
+// Render will set PORT via environment; default to 10000
 const PORT = process.env.PORT || 10000;
 
 // Read Groq API key from environment
@@ -10,7 +11,7 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 // Allow JSON body
 app.use(express.json());
 
-// Allow requests from your GitHub Pages origin (or any frontend you use)
+// Allow requests from your GitHub Pages origin (or other frontend)
 app.use(cors({
   origin: 'https://amanvbhardwaj.github.io',
 }));
@@ -26,8 +27,10 @@ async function callGroq(prompt) {
     body: JSON.stringify({
       model: 'llama3-70b-8192',
       messages: [
-        { role: 'system', content: 'You are a helpful AI assistant called Jarvis.' },
-        { role: 'user', content: prompt },
+        {
+          role: 'user',
+          content: prompt,
+        },
       ],
     }),
   });
