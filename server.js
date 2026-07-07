@@ -459,6 +459,186 @@ app.post('/api/outreach/approve', async (req, res) => {
   });
 });
 
+// ===========================================================================
+// PLAID — real bank + investment stats (Scotiabank, Wealthsimple, etc.)
+// Read-only. Jarvis NEVER moves money. Requires these env vars on Render:
+//   PLAID_CLIENT_ID, PLAID_SECRET, and PLAID_ENV (sandbox | development | production)
+// Flow: /link/token -> Plaid Link on frontend -> /exchange -> stored access_token
+//       -> /balances, /transactions, /investments read live data.
+// ===========================================================================
+const PLAID_CLIENT_ID = process.env.PLAID_CLIENT_ID;
+const PLAID_SECRET = process.env.PLAID_SECRET;
+const PLAID_ENV = process.env.PLAID_ENV || 'sandbox';
+const PLAID_HOST = `https://${PLAID_ENV}.plaid.com`;
+
+function plaidConfigured() { return !!(PLAID_CLIENT_ID && PLAID_SECRET); }
+
+async function plaidCall(path, body) {
+  const resp = await fetchFn(PLAID_HOST + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ client_id: PLAID_CLIENT_ID, secret: PLAID_SECRET, ...body }),
+  });
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(data.error_message || `Plaid error ${resp.status}`);
+  return data;
+}
+
+// 1) Create a Link token (frontend uses this to open Plaid Link)
+app.post('/api/plaid/link-token', async (req, res) => {
+  if (!plaidConfigured()) {
+    return res.status(200).json({ ok: false, note: 'Plaid not configured yet. Add PLAID_CLIENT_ID, PLAID_SECRET, PLAID_ENV on Render.' });
+  }
+  try {
+    const data = await plaidCall('/link/token/create', {
+      user: { client_user_id: 'aman' },
+      client_name: 'Aman OS Jarvis',
+      products: ['transactions', 'investments'],
+      country_codes: ['CA', 'US'],
+      language: 'en',
+    });
+    res.json({ ok: true, link_token: data.link_token });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// 2) Exchange the public_token from Link for a durable access_token; store it
+app.post('/api/plaid/exchange', async (req, res) => {
+  if (!plaidConfigured()) return res.status(200).json({ ok: false, note: 'Plaid not configured.' });
+  try {
+    const { public_token, institution } = req.body || {};
+    const data = await plaidCall('/item/public_token/exchange', { public_token });
+    // Store per-institution so multiple banks (Scotiabank + Wealthsimple) can coexist
+    await saveDoc('plaid_items', {
+      institution: institution || 'unknown',
+      access_token: data.access_token,
+      item_id: data.item_id,
+    });
+    res.json({ ok: true, item_id: data.item_id, note: `${institution || 'Account'} linked.` });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Helper: get all stored Plaid access tokens
+async function getPlaidItems() {
+  const items = await recentDocs('plaid_items', 25);
+  // De-dup by item_id, keep latest
+  const byItem = {};
+  items.forEach(i => { if (i.item_id) byItem[i.item_id] = i; });
+  return Object.values(byItem);
+}
+
+// 3) Live balances across all linked accounts
+app.get('/api/plaid/balances', async (req, res) => {
+  if (!plaidConfigured()) return res.status(200).json({ ok: false, note: 'Plaid not configured.' });
+  try {
+    const items = await getPlaidItems();
+    const out = [];
+    for (const it of items) {
+      try {
+        const d = await plaidCall('/accounts/balance/get', { access_token: it.access_token });
+        (d.accounts || []).forEach(a => out.push({
+          institution: it.institution,
+          name: a.name, subtype: a.subtype,
+          available: a.balances.available, current: a.balances.current,
+          currency: a.balances.iso_currency_code,
+        }));
+      } catch (e) { out.push({ institution: it.institution, error: e.message }); }
+    }
+    res.json({ ok: true, accounts: out });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// 4) Recent transactions (last 30 days)
+app.get('/api/plaid/transactions', async (req, res) => {
+  if (!plaidConfigured()) return res.status(200).json({ ok: false, note: 'Plaid not configured.' });
+  try {
+    const items = await getPlaidItems();
+    const end = new Date().toISOString().slice(0, 10);
+    const start = new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10);
+    const txns = [];
+    for (const it of items) {
+      try {
+        const d = await plaidCall('/transactions/get', {
+          access_token: it.access_token, start_date: start, end_date: end,
+          options: { count: 100 },
+        });
+        (d.transactions || []).forEach(t => txns.push({
+          institution: it.institution, date: t.date, name: t.name,
+          amount: t.amount, category: (t.category || []).join(' > '),
+        }));
+      } catch (e) { /* skip item */ }
+    }
+    res.json({ ok: true, transactions: txns });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// 5) Investment holdings (Wealthsimple portfolio stats)
+app.get('/api/plaid/investments', async (req, res) => {
+  if (!plaidConfigured()) return res.status(200).json({ ok: false, note: 'Plaid not configured.' });
+  try {
+    const items = await getPlaidItems();
+    const holdings = [];
+    for (const it of items) {
+      try {
+        const d = await plaidCall('/investments/holdings/get', { access_token: it.access_token });
+        const secById = {};
+        (d.securities || []).forEach(s => { secById[s.security_id] = s; });
+        (d.holdings || []).forEach(h => {
+          const s = secById[h.security_id] || {};
+          holdings.push({
+            institution: it.institution, ticker: s.ticker_symbol || s.name,
+            quantity: h.quantity, price: h.institution_price,
+            value: h.institution_value, currency: h.iso_currency_code,
+          });
+        });
+      } catch (e) { /* skip non-investment items */ }
+    }
+    res.json({ ok: true, holdings });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// 6) Jarvis reads live money stats and gives a spoken CFO summary
+app.post('/api/plaid/summary', async (req, res) => {
+  if (!requireKey(res)) return;
+  if (!plaidConfigured()) return res.json({ reply: 'Your bank isn\u2019t linked yet. Add your Plaid keys on the backend and connect Scotiabank and Wealthsimple, then I can pull real numbers.' });
+  try {
+    const items = await getPlaidItems();
+    const balances = [], holdings = [];
+    for (const it of items) {
+      try { const d = await plaidCall('/accounts/balance/get', { access_token: it.access_token });
+        (d.accounts || []).forEach(a => balances.push({ inst: it.institution, name: a.name, current: a.balances.current, cur: a.balances.iso_currency_code })); } catch (e) {}
+      try { const d = await plaidCall('/investments/holdings/get', { access_token: it.access_token });
+        const total = (d.holdings || []).reduce((s, h) => s + (h.institution_value || 0), 0);
+        if (total) holdings.push({ inst: it.institution, total }); } catch (e) {}
+    }
+    const profile = await getProfile();
+    const extra = `[Live account data]\nBalances: ${JSON.stringify(balances)}\nInvestments: ${JSON.stringify(holdings)}\n\nGive Aman a short spoken CFO snapshot: total cash, total invested, and one sharp observation. No lists.`;
+    const reply = await callBrain([
+      { role: 'system', content: BASE_PERSONA + buildContext(profile, null, extra) },
+      { role: 'user', content: 'Give me my money snapshot.' },
+    ], { maxTokens: 220 });
+    res.json({ reply, balances, holdings });
+  } catch (e) { res.status(500).json({ reply: 'Could not read your accounts right now.' }); }
+});
+
+// ===========================================================================
+// LINKEDIN — draft-only (LinkedIn forbids auto-posting for personal accounts).
+// Jarvis writes the post; Aman reviews and posts it himself.
+// ===========================================================================
+app.post('/api/linkedin/draft', async (req, res) => {
+  if (!requireKey(res)) return;
+  try {
+    const { topic, tone } = req.body || {};
+    const profile = await getProfile();
+    const extra = `Write a LinkedIn post for Aman about: ${topic || 'a recent professional win'}. Tone: ${tone || 'confident, authentic, first-person'}. 120-180 words, 2-4 short paragraphs, one soft call to engage. Return ONLY the post text (this one CAN use line breaks since it is copy-pasted, not spoken).\n\nNote: LinkedIn does not allow apps to auto-post to personal profiles, so this is a draft for Aman to review and post himself.`;
+    const reply = await callSonar([
+      { role: 'system', content: BASE_PERSONA + buildContext(profile, [], extra) },
+      { role: 'user', content: `Draft a LinkedIn post about ${topic || 'my work'}.` },
+    ]);
+    await saveDoc('linkedin_drafts', { topic, draft: reply, status: 'draft' });
+    res.json({ reply, note: 'Draft ready. Review and post it on LinkedIn yourself \u2014 LinkedIn blocks auto-posting to personal profiles.' });
+  } catch (e) { res.status(500).json({ reply: 'LinkedIn draft error.' }); }
+});
+
 app.listen(PORT, () => {
-  console.log(`Jarvis backend v2 running on port ${PORT} (model: ${JARVIS_MODEL})`);
+  console.log(`Jarvis backend v2 running on port ${PORT} (model: ${JARVIS_MODEL}, plaid: ${plaidConfigured() ? PLAID_ENV : 'off'})`);
 });
