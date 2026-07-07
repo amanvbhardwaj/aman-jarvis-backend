@@ -327,6 +327,83 @@ IMPORTANT: You never move money or transact. These are researched suggestions fo
   } catch (e) { res.status(500).json({ reply: 'Income module error.' }); }
 });
 
+// ---------------------------------------------------------------------------
+// CONTENT — approve & mark ready to post (human-in-the-loop)
+// Jarvis creates content; you confirm; this marks it approved. Actual publishing
+// to Instagram happens only after you connect the Instagram Graph API and approve.
+// ---------------------------------------------------------------------------
+app.post('/api/content/approve', async (req, res) => {
+  const { draft, topic, format, decision } = req.body || {};
+  const status = decision === 'approve' ? 'approved_ready_to_post' : 'rejected';
+  await saveDoc('content_drafts', { draft, topic, format, status, approvedAt: new Date() });
+  res.json({
+    ok: true,
+    status,
+    note: status === 'approved_ready_to_post'
+      ? 'Approved and queued. It will post once Instagram publishing is connected. Nothing posts without your approval.'
+      : 'Marked as rejected. Nothing was posted.'
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MODULE 7 — MARKETING ASSISTANT (product marketing, ad copy, campaigns)
+// ---------------------------------------------------------------------------
+app.post('/api/marketing/campaign', async (req, res) => {
+  if (!requireKey(res)) return;
+  try {
+    const product = (req.body && req.body.product) || 'a service Aman offers';
+    const goal = (req.body && req.body.goal) || 'generate leads and revenue';
+    const channel = (req.body && req.body.channel) || 'Instagram + Meta ads';
+    const budget = (req.body && req.body.budget) || 'flexible / lean';
+    const extra = `Act as Aman's marketing strategist. Product/offer: ${product}. Goal: ${goal}. Channel(s): ${channel}. Budget: ${budget}.
+Deliver a ready-to-run plan: 1) target audience, 2) core message/positioning, 3) 3 ad variations (headline + primary text + CTA), 4) suggested budget split & schedule, 5) success metrics.
+IMPORTANT: This is a plan for Aman to review. You do not spend money or launch ads yourself; Aman approves and launches.`;
+    const reply = await callSonar([
+      { role: 'system', content: BASE_PERSONA + buildContext(await getProfile(), [], extra) },
+      { role: 'user', content: `Build a marketing campaign for: ${product}.` },
+    ]);
+    await saveDoc('marketing_campaigns', { product, goal, channel, budget, plan: reply, status: 'draft' });
+    res.json({ reply, note: 'Draft campaign saved. You approve and launch ads yourself — Jarvis never spends your money.' });
+  } catch (e) { res.status(500).json({ reply: 'Marketing module error.' }); }
+});
+
+// ---------------------------------------------------------------------------
+// MODULE 8 — CLIENT OUTREACH / GET PROJECTS (revenue engine)
+// Drafts outreach offering Aman's marketing/ad services, includes his Interac
+// email for payment, and queues it for approval. Approval-gated sending only.
+// ---------------------------------------------------------------------------
+app.post('/api/outreach/draft', async (req, res) => {
+  if (!requireKey(res)) return;
+  try {
+    const profile = await getProfile();
+    const interac = (req.body && req.body.interacEmail) || (profile && profile.interacEmail) || 'YOUR_INTERAC_EMAIL';
+    const service = (req.body && req.body.service) || 'social media marketing & ad management';
+    const target = (req.body && req.body.target) || 'local businesses that could use more customers';
+    const extra = `Act as Aman's business-development assistant. Draft outreach to: ${target}, offering: ${service}.
+Write: 1) a short, warm, non-spammy outreach message asking if they'd like help running ads / marketing to grow revenue, 2) a one-line value proposition, 3) a simple pricing/next-step line, 4) a polite payment note that Aman accepts Interac e-Transfer at ${interac}.
+Keep it compliant with Canada's anti-spam law (CASL): identify Aman clearly, offer an easy opt-out, no misleading claims.
+IMPORTANT: This is a DRAFT. Aman reviews and sends it himself (or approves sending). You never mass-send or spam.`;
+    const reply = await callSonar([
+      { role: 'system', content: BASE_PERSONA + buildContext(profile, [], extra) },
+      { role: 'user', content: `Draft client outreach offering ${service}.` },
+    ]);
+    await saveDoc('outreach_drafts', { service, target, interac, draft: reply, status: 'draft' });
+    res.json({ reply, note: 'Outreach draft saved. Review, then approve to send — Jarvis will not mass-send (keeps you CASL-compliant and protects your email).' });
+  } catch (e) { res.status(500).json({ reply: 'Outreach module error.' }); }
+});
+
+app.post('/api/outreach/approve', async (req, res) => {
+  const { draft, decision, sendTo } = req.body || {};
+  const status = decision === 'approve' ? 'approved_to_send' : 'rejected';
+  await saveDoc('outreach_drafts', { draft, sendTo, status, approvedAt: new Date() });
+  res.json({
+    ok: true, status,
+    note: status === 'approved_to_send'
+      ? 'Approved. Connect an email connector to send, or send it yourself. Nothing goes out without your approval.'
+      : 'Rejected. Nothing was sent.'
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`Jarvis backend v2 running on port ${PORT} (model: ${JARVIS_MODEL})`);
 });
