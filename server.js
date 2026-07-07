@@ -730,7 +730,7 @@ app.post('/api/invest/approve', async (req, res) => {
       await saveDoc('trade_proposals', { order, status: 'approved_no_broker' });
       return res.json({
         ok: true, status: 'approved_pending_broker',
-        note: 'Approved. No trading broker is connected yet, so I could not place it automatically. Connect Interactive Brokers (IBKR_GATEWAY_URL + IBKR_ACCOUNT_ID) to enable one-tap placing, or place this order yourself in the meantime.'
+        note: 'Approved and staged. No broker is connected yet, so place this order yourself for now. Connect Interactive Brokers (IBKR_GATEWAY_URL + IBKR_ACCOUNT_ID) so I can stage it into your IBKR app for a one-tap submit.'
       });
     }
     // Broker adapter (IBKR Web API). Requires an authenticated IBKR gateway session.
@@ -744,13 +744,126 @@ app.post('/api/invest/approve', async (req, res) => {
         body: JSON.stringify({ orders: [{ conid: Number(conid), orderType: 'MKT', side: (order.action || 'buy').toUpperCase(), tif: 'DAY', quantity: order.quantity || 1 }] }),
       });
       const placed = await placeResp.json();
-      await saveDoc('trade_proposals', { order, status: 'placed', broker: 'IBKR', result: placed });
-      res.json({ ok: true, status: 'placed', result: placed, note: 'Order sent to IBKR.' });
+      await saveDoc('trade_proposals', { order, status: 'staged', broker: 'IBKR', result: placed });
+      // NOTE: Under Canadian rules (CIRO DMR 3200), the final submit is yours. This
+      // stages the order into IBKR; confirm/submit it in your IBKR app or via the
+      // reply endpoint. We never auto-transmit without your action.
+      res.json({ ok: true, status: 'staged', result: placed, note: 'Staged into IBKR. Give it the final tap-to-submit in your IBKR app (Canadian rules require your manual submit).' });
     } catch (e) {
       await saveDoc('trade_proposals', { order, status: 'place_failed', error: e.message });
       res.status(502).json({ ok: false, status: 'place_failed', error: e.message });
     }
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ===========================================================================
+// SAFETY SETTINGS — the guardrails Jarvis must always respect.
+// Stored in Firestore (invest_settings/aman). Sensible defaults if unset.
+// ===========================================================================
+const DEFAULT_INVEST_SETTINGS = {
+  maxPerTrade: 500,     // never propose a single trade above this ($)
+  cashCushion: 1000,    // never propose investing below this reserve ($)
+  stopLossPct: 8,       // every proposal carries a stop this % below entry
+  bigDropPct: 5,        // alert if a holding/market drops this % intraday
+};
+async function getInvestSettings() {
+  if (!db) return { ...DEFAULT_INVEST_SETTINGS };
+  try {
+    const doc = await db.collection('invest_settings').doc('aman').get();
+    return doc.exists ? { ...DEFAULT_INVEST_SETTINGS, ...doc.data() } : { ...DEFAULT_INVEST_SETTINGS };
+  } catch (e) { return { ...DEFAULT_INVEST_SETTINGS }; }
+}
+app.get('/api/invest/settings', async (req, res) => {
+  res.json({ ok: true, settings: await getInvestSettings() });
+});
+app.post('/api/invest/settings', async (req, res) => {
+  if (!db) return res.json({ ok: false, note: 'Memory not configured; using defaults.' });
+  try {
+    const b = req.body || {};
+    const next = {};
+    ['maxPerTrade','cashCushion','stopLossPct','bigDropPct'].forEach(k => {
+      if (b[k] !== undefined && b[k] !== '' && !isNaN(Number(b[k]))) next[k] = Number(b[k]);
+    });
+    await db.collection('invest_settings').doc('aman').set(next, { merge: true });
+    res.json({ ok: true, settings: await getInvestSettings() });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// Pull a light view of Aman's investable cash + holdings (read-only via Plaid).
+async function getMoneySnapshot() {
+  let cash = 0; const holdings = [];
+  try {
+    const items = await getPlaidItems();
+    for (const it of items) {
+      try { const b = await plaidCall('/accounts/balance/get', { access_token: it.access_token });
+        (b.accounts||[]).forEach(a => { if (a.type === 'depository') cash += (a.balances && a.balances.available) || 0; });
+      } catch (e) {}
+      try { const d = await plaidCall('/investments/holdings/get', { access_token: it.access_token });
+        (d.holdings||[]).forEach(x => holdings.push({ value: x.institution_value }));
+        (d.securities||[]).forEach(s => { if (s.ticker_symbol) holdings.push({ ticker: s.ticker_symbol }); });
+      } catch (e) {}
+    }
+  } catch (e) {}
+  return { cash, holdings };
+}
+
+// ===========================================================================
+// NIGHTLY BRIEFING — runs at 8pm (via cron). Jarvis researches the market
+// against Aman's goals + holdings + safety rails and stages ONE proposal for
+// the morning. Saved so the app can show it and Aman can approve at open.
+// ===========================================================================
+app.post('/api/invest/nightly-briefing', async (req, res) => {
+  if (!requireKey(res)) return;
+  try {
+    const [profile, settings, money] = await Promise.all([getProfile(), getInvestSettings(), getMoneySnapshot()]);
+    const investable = Math.max(0, (money.cash || 0) - settings.cashCushion);
+    const cap = Math.min(settings.maxPerTrade, investable || settings.maxPerTrade);
+    const extra = `It is the evening research session. Scan today's market across ETFs/index funds, individual stocks, dividend names, and major crypto, and prepare ONE specific idea for Aman to consider placing tomorrow.\n`
+      + `HARD SAFETY RULES you must obey: never suggest more than $${cap} for this single trade; keep a cash cushion of $${settings.cashCushion} untouched; every idea MUST include a stop-loss about ${settings.stopLossPct}% below entry.\n`
+      + `Cash available to invest after the cushion: about $${investable}. Holdings seen: ${JSON.stringify(money.holdings).slice(0,500)}.\n\n`
+      + `Speak it as a short overnight briefing (under 80 words): name the ticker, buy/sell, roughly how much (within the cap), one line of why from what's happening now, and the stop level. End with EXACTLY this on its own line: ORDER: {"action":"buy|sell","ticker":"TICKER","amount":"$X","stop":"$Y or -${settings.stopLossPct}%"}. Make clear you will only stage it and he taps to submit in the morning.`;
+    const reply = await callBrain([
+      { role: 'system', content: BASE_PERSONA + buildContext(profile, null, extra) },
+      { role: 'user', content: 'Give me tonight\'s investment briefing for tomorrow.' },
+    ], { maxTokens: 320 });
+    let order = null;
+    const m = reply.match(/ORDER:\s*(\{.*\})/s);
+    if (m) { try { order = JSON.parse(m[1]); } catch (e) {} }
+    const spoken = reply.replace(/ORDER:\s*\{.*\}/s, '').trim();
+    await saveDoc('nightly_briefings', { spoken, order, settings, investable, status: 'pending_morning_approval' });
+    res.json({ ok: true, reply: spoken, order, cap, investable, note: 'Staged for the morning. Nothing is placed until you approve and submit.' });
+  } catch (e) { res.status(500).json({ ok: false, reply: 'Could not prepare tonight\'s briefing.' }); }
+});
+
+// Latest pending briefing, so the app can show it when Aman wakes up.
+app.get('/api/invest/nightly-briefing/latest', async (req, res) => {
+  const docs = await recentDocs('nightly_briefings', 1);
+  res.json({ ok: true, briefing: docs[docs.length - 1] || null });
+});
+
+// ===========================================================================
+// SAFETY CHECK — runs during market hours (via cron). Watches holdings/market
+// for sharp moves and alerts Aman with a recommended (never auto) action.
+// ===========================================================================
+app.post('/api/invest/safety-check', async (req, res) => {
+  if (!requireKey(res)) return;
+  try {
+    const [profile, settings, money] = await Promise.all([getProfile(), getInvestSettings(), getMoneySnapshot()]);
+    const tickers = money.holdings.filter(h => h.ticker).map(h => h.ticker).slice(0, 12);
+    const extra = `It is a mid-day safety check. Aman holds roughly these tickers: ${JSON.stringify(tickers)}. Alert threshold: a ${settings.bigDropPct}% or larger drop.\n`
+      + `Using what you know about today's market, decide if anything he holds — or the broad market — has moved sharply enough to matter right now.\n`
+      + `Reply in under 50 spoken words. If nothing significant, say all clear briefly. If something dropped hard, name it, say by how much, and recommend ONE cautious action (e.g. hold, trim, or set a stop) — you only recommend, he decides. End with EXACTLY: ALERT: {"level":"none|watch|act"}.`;
+    const reply = await callBrain([
+      { role: 'system', content: BASE_PERSONA + buildContext(profile, null, extra) },
+      { role: 'user', content: 'Any safety concerns in my investments right now?' },
+    ], { maxTokens: 200 });
+    let level = 'none';
+    const m = reply.match(/ALERT:\s*\{[^}]*"level"\s*:\s*"(none|watch|act)"/);
+    if (m) level = m[1];
+    const spoken = reply.replace(/ALERT:\s*\{.*\}/s, '').trim();
+    await saveDoc('safety_checks', { spoken, level });
+    res.json({ ok: true, reply: spoken, level });
+  } catch (e) { res.status(500).json({ ok: false, reply: 'Safety check error.' }); }
 });
 
 app.listen(PORT, () => {
