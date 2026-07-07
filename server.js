@@ -639,6 +639,120 @@ app.post('/api/linkedin/draft', async (req, res) => {
   } catch (e) { res.status(500).json({ reply: 'LinkedIn draft error.' }); }
 });
 
+// ===========================================================================
+// VOICE — human-like TTS via ElevenLabs (proxied so the key stays server-side).
+// Set ELEVENLABS_API_KEY (and optionally ELEVENLABS_VOICE_ID) on Render.
+// Frontend POSTs text; we stream back MP3 audio. Falls back to browser voice
+// on the frontend if this endpoint says it's not configured.
+// ===========================================================================
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'JBFqnCBsd6RMkjVDRZzb'; // default: warm male "George"
+
+app.get('/api/voice/status', (req, res) => {
+  res.json({ ok: true, premium: !!ELEVENLABS_API_KEY });
+});
+
+app.post('/api/voice/speak', async (req, res) => {
+  if (!ELEVENLABS_API_KEY) {
+    return res.status(200).json({ ok: false, note: 'ElevenLabs not configured. Add ELEVENLABS_API_KEY on Render.' });
+  }
+  try {
+    const text = (req.body && req.body.text ? String(req.body.text) : '').slice(0, 800);
+    if (!text) return res.status(400).json({ ok: false, error: 'no text' });
+    const r = await fetchFn(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
+      method: 'POST',
+      headers: {
+        'xi-api-key': ELEVENLABS_API_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'audio/mpeg',
+      },
+      body: JSON.stringify({
+        text,
+        model_id: 'eleven_turbo_v2_5',
+        voice_settings: { stability: 0.4, similarity_boost: 0.8, style: 0.3, use_speaker_boost: true },
+      }),
+    });
+    if (!r.ok) {
+      const detail = await r.text().catch(() => '');
+      return res.status(502).json({ ok: false, error: `ElevenLabs ${r.status} ${detail}` });
+    }
+    const buf = Buffer.from(await r.arrayBuffer());
+    res.set('Content-Type', 'audio/mpeg');
+    res.send(buf);
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ===========================================================================
+// INVESTING — Jarvis PROPOSES a trade; Aman APPROVES; then it's placed.
+// Never auto-trades without approval. Wealthsimple has NO public trading API,
+// so real execution requires a broker that does (Interactive Brokers is the
+// realistic Canadian option). Until IBKR creds are set, this is propose-only.
+// Env vars for live placing: IBKR_ACCOUNT_ID, IBKR_GATEWAY_URL (your IBKR Web
+// API gateway), and IBKR_SESSION handling per IBKR docs.
+// ===========================================================================
+const IBKR_GATEWAY_URL = process.env.IBKR_GATEWAY_URL;
+const IBKR_ACCOUNT_ID = process.env.IBKR_ACCOUNT_ID;
+function brokerConfigured() { return !!(IBKR_GATEWAY_URL && IBKR_ACCOUNT_ID); }
+
+// 1) Jarvis proposes a specific trade (analysis + exact order), saved as pending.
+app.post('/api/invest/propose', async (req, res) => {
+  if (!requireKey(res)) return;
+  try {
+    const { goal, amount, risk } = req.body || {};
+    const [profile, holdings] = await Promise.all([
+      getProfile(),
+      (async () => { try { const items = await getPlaidItems(); const h = []; for (const it of items) { try { const d = await plaidCall('/investments/holdings/get', { access_token: it.access_token }); (d.holdings||[]).forEach(x=>h.push({ v:x.institution_value })); } catch(e){} } return h; } catch(e){ return []; } })(),
+    ]);
+    const extra = `Aman wants an investment suggestion. Goal: ${goal || 'long-term growth'}. Amount to deploy: ${amount || 'unspecified'}. Risk: ${risk || 'moderate'}. Current holdings value seen: ${JSON.stringify(holdings)}.\n\nPropose ONE specific, sensible trade as plain spoken sentences: the ticker, buy or sell, roughly how much, and one line of why. Then add a final line EXACTLY in this format on its own: ORDER: {"action":"buy|sell","ticker":"TICKER","amount":"$X or N shares"}. Keep the spoken part under 60 words. Remind him you will only place it once he approves.`;
+    const reply = await callBrain([
+      { role: 'system', content: BASE_PERSONA + buildContext(profile, null, extra) },
+      { role: 'user', content: 'Suggest an investment.' },
+    ], { maxTokens: 260 });
+    // Extract the ORDER json if present
+    let order = null;
+    const m = reply.match(/ORDER:\s*(\{.*\})/s);
+    if (m) { try { order = JSON.parse(m[1]); } catch (e) {} }
+    const spoken = reply.replace(/ORDER:\s*\{.*\}/s, '').trim();
+    await saveDoc('trade_proposals', { goal, amount, risk, order, spoken, status: 'proposed' });
+    res.json({ reply: spoken, order, note: 'This is a proposal. Nothing is placed until you approve.' });
+  } catch (e) { res.status(500).json({ reply: 'Investing module error.' }); }
+});
+
+// 2) Aman approves (or rejects). On approve, place via broker if configured.
+app.post('/api/invest/approve', async (req, res) => {
+  try {
+    const { order, decision } = req.body || {};
+    if (decision !== 'approve') {
+      await saveDoc('trade_proposals', { order, status: 'rejected' });
+      return res.json({ ok: true, status: 'rejected', note: 'Rejected. Nothing was placed.' });
+    }
+    if (!brokerConfigured()) {
+      await saveDoc('trade_proposals', { order, status: 'approved_no_broker' });
+      return res.json({
+        ok: true, status: 'approved_pending_broker',
+        note: 'Approved. No trading broker is connected yet, so I could not place it automatically. Connect Interactive Brokers (IBKR_GATEWAY_URL + IBKR_ACCOUNT_ID) to enable one-tap placing, or place this order yourself in the meantime.'
+      });
+    }
+    // Broker adapter (IBKR Web API). Requires an authenticated IBKR gateway session.
+    try {
+      const conidResp = await fetchFn(`${IBKR_GATEWAY_URL}/v1/api/iserver/secdef/search?symbol=${encodeURIComponent(order.ticker)}`);
+      const conids = await conidResp.json();
+      const conid = Array.isArray(conids) && conids[0] && conids[0].conid;
+      if (!conid) throw new Error('Could not resolve ticker to a contract id.');
+      const placeResp = await fetchFn(`${IBKR_GATEWAY_URL}/v1/api/iserver/account/${IBKR_ACCOUNT_ID}/orders`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ orders: [{ conid: Number(conid), orderType: 'MKT', side: (order.action || 'buy').toUpperCase(), tif: 'DAY', quantity: order.quantity || 1 }] }),
+      });
+      const placed = await placeResp.json();
+      await saveDoc('trade_proposals', { order, status: 'placed', broker: 'IBKR', result: placed });
+      res.json({ ok: true, status: 'placed', result: placed, note: 'Order sent to IBKR.' });
+    } catch (e) {
+      await saveDoc('trade_proposals', { order, status: 'place_failed', error: e.message });
+      res.status(502).json({ ok: false, status: 'place_failed', error: e.message });
+    }
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
 app.listen(PORT, () => {
-  console.log(`Jarvis backend v2 running on port ${PORT} (model: ${JARVIS_MODEL}, plaid: ${plaidConfigured() ? PLAID_ENV : 'off'})`);
+  console.log(`Jarvis backend v2 on ${PORT} (model: ${JARVIS_MODEL}, plaid: ${plaidConfigured() ? PLAID_ENV : 'off'}, voice: ${ELEVENLABS_API_KEY ? 'elevenlabs' : 'browser'}, broker: ${brokerConfigured() ? 'ibkr' : 'off'})`);
 });
