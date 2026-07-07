@@ -27,7 +27,11 @@ async function callOpenRouter(prompt) {
       'X-OpenRouter-Title': 'Aman Jarvis',
     },
     body: JSON.stringify({
-      model: 'openrouter/auto',
+      // Use Claude Sonnet as the single Jarvis brain
+      // You can use latest Sonnet:
+      model: '~anthropic/claude-sonnet-latest',
+      // or pin a specific version:
+      // model: 'anthropic/claude-sonnet-4.6',
       messages: [
         {
           role: 'user',
@@ -52,7 +56,7 @@ async function callOpenRouter(prompt) {
 
 // Health check
 app.get('/', (req, res) => {
-  res.send('Aman Jarvis backend v3 (OpenRouter) is running');
+  res.send('Aman Jarvis backend v3 (OpenRouter, Claude Sonnet) is running');
 });
 
 // Jarvis endpoint: now uses OpenRouter
