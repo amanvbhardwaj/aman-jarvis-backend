@@ -74,20 +74,21 @@ async function getProfile() {
 // ---------------------------------------------------------------------------
 // Jarvis persona
 // ---------------------------------------------------------------------------
-const BASE_PERSONA = `You are Jarvis, the personal life operating system for Aman Bhardwaj.
-Aman lives in Toronto, works in consulting, trains for Hyrox, plays competitive badminton,
-does strength training, is navigating Canadian immigration (Express Entry / CEC), and cares
-deeply about personal finance, health, nutrition, technology, and building income streams.
+const BASE_PERSONA = `You are JARVIS — Aman Bhardwaj's personal AI, in the spirit of Tony Stark's JARVIS.
+You speak TO Aman, out loud, like a calm, witty, hyper-competent butler-strategist. He is in Toronto,
+works in consulting, trains for Hyrox, plays competitive badminton, lifts, is navigating Canadian
+immigration (Express Entry / CEC), and cares about money, health, nutrition, tech, and income.
 
-Your role: a warm, sharp, practical companion — personal CFO + health & nutrition coach +
-planner + creative producer. Rules:
-- Lead with the answer, then a brief reason. Be concise and specific.
-- Give concrete, actionable next steps for money, health, nutrition, and immigration.
-- Use your live web access for current facts and cite briefly when relevant.
-- Never move money, transact, or post publicly on your own. You draft and recommend;
-  Aman approves and acts. Say so plainly if asked to do something unsafe.
-- Ask at most one clarifying question and only when truly necessary.
-- Warm, calm, encouraging tone. You are Aman's Jarvis.`;
+HOW YOU TALK (this is spoken aloud, so it matters a lot):
+- Sound like a real conversation, not an essay. Warm, dry wit, unflappable. Address him directly ("you", occasionally "sir" sparingly).
+- DEFAULT TO SHORT: 1–3 sentences. Only go longer if he explicitly asks for detail or a plan.
+- Give the answer first. No preambles like "Certainly" or "Great question". No headers, no bullet lists, no markdown, no emojis, no citations — this is being read aloud.
+- Do NOT ask clarifying questions unless it's genuinely impossible to proceed. If something is ambiguous, make a sensible assumption, act on it, and say what you assumed in a few words. Never stall the conversation with a question.
+- Remember the recent conversation and stay on topic. If he gives a one-word or vague reply, interpret it in context of what you just discussed.
+- You can be proactive: offer one useful next step, but keep it to one line.
+
+WHAT YOU DO: personal CFO, health & nutrition coach, planner, creative producer, income strategist.
+SAFETY: You never move money, transact, or post publicly on your own. You draft and recommend; Aman approves and acts. Say so plainly if asked to do something unsafe.`;
 
 function buildContext(profile, history, extra) {
   let ctx = '';
@@ -102,15 +103,54 @@ function buildContext(profile, history, extra) {
   return ctx;
 }
 
-// Core call to Perplexity Sonar
-async function callSonar(messages, model = JARVIS_MODEL) {
+// Optional Claude (Anthropic) support. If ANTHROPIC_API_KEY is set, Jarvis's brain
+// uses Claude for conversation; otherwise it uses Perplexity Sonar. This lets Aman
+// flip to Claude Opus later just by adding one env var — no code changes needed.
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-opus-4-20250514';
+
+// Call Claude (Anthropic Messages API). Converts OpenAI-style messages.
+async function callClaude(messages, maxTokens = 400) {
+  const system = messages.filter(m => m.role === 'system').map(m => m.content).join('\n\n');
+  const turns = messages
+    .filter(m => m.role === 'user' || m.role === 'assistant')
+    .map(m => ({ role: m.role, content: m.content }));
+  const response = await fetchFn('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({ model: CLAUDE_MODEL, max_tokens: maxTokens, system, messages: turns }),
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(`Anthropic API error: ${response.status} ${response.statusText} ${detail}`);
+  }
+  const data = await response.json();
+  return (data?.content?.[0]?.text) || 'Sorry, I could not generate a reply.';
+}
+
+// Core brain call. Picks Claude if configured, else Perplexity Sonar.
+// maxTokens keeps spoken replies short so Jarvis doesn't ramble.
+async function callBrain(messages, opts = {}) {
+  const maxTokens = opts.maxTokens || 400;
+  if (ANTHROPIC_API_KEY) {
+    return callClaude(messages, maxTokens);
+  }
   const response = await fetchFn('https://api.perplexity.ai/chat/completions', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${PERPLEXITY_API_KEY}`,
     },
-    body: JSON.stringify({ model, messages }),
+    body: JSON.stringify({
+      model: opts.model || JARVIS_MODEL,
+      messages,
+      max_tokens: maxTokens,
+      temperature: 0.5,
+    }),
   });
   if (!response.ok) {
     const detail = await response.text().catch(() => '');
@@ -120,9 +160,14 @@ async function callSonar(messages, model = JARVIS_MODEL) {
   return data?.choices?.[0]?.message?.content || 'Sorry, I could not generate a reply.';
 }
 
+// Back-compat alias so existing module endpoints keep working.
+async function callSonar(messages, model = JARVIS_MODEL) {
+  return callBrain(messages, { model, maxTokens: 600 });
+}
+
 function requireKey(res) {
-  if (!PERPLEXITY_API_KEY) {
-    res.status(500).json({ reply: 'Server error: PERPLEXITY_API_KEY is not set on the backend.' });
+  if (!PERPLEXITY_API_KEY && !ANTHROPIC_API_KEY) {
+    res.status(500).json({ reply: 'Server error: no AI key is set on the backend (need PERPLEXITY_API_KEY or ANTHROPIC_API_KEY).' });
     return false;
   }
   return true;
@@ -148,11 +193,19 @@ app.post('/api/jarvis', async (req, res) => {
       recentDocs('jarvis_messages', 12),
     ]);
 
-    const systemContent = BASE_PERSONA + buildContext(profile, history);
-    const reply = await callSonar([
+    // Put durable profile in the system prompt, but feed recent turns as REAL
+    // conversation turns so Jarvis stays in context and replies like a dialogue.
+    const systemContent = BASE_PERSONA + buildContext(profile, null);
+    const priorTurns = (history || [])
+      .filter(m => m && m.text && (m.role === 'user' || m.role === 'assistant'))
+      .slice(-8)
+      .map(m => ({ role: m.role, content: String(m.text) }));
+
+    const reply = await callBrain([
       { role: 'system', content: systemContent },
+      ...priorTurns,
       { role: 'user', content: userMessage },
-    ]);
+    ], { maxTokens: 350 });
 
     // Save both sides to memory (server-side if available)
     await saveDoc('jarvis_messages', { role: 'user', text: userMessage });
